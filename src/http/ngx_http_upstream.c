@@ -9,6 +9,7 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 
+#include <ngx_http_apicast_module.h>
 
 #if (NGX_HTTP_CACHE)
 static ngx_int_t ngx_http_upstream_cache(ngx_http_request_t *r,
@@ -1701,6 +1702,7 @@ ngx_http_upstream_ssl_init_connection(ngx_http_request_t *r,
         }
     }
 
+    ngx_http_upstream_secure_connection_handler(r, u, c);
     r->connection->log->action = "SSL handshaking to upstream";
 
     rc = ngx_ssl_handshake(c);
