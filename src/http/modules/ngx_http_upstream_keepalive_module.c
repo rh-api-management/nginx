@@ -21,6 +21,8 @@ typedef struct {
     ngx_http_upstream_init_pt          original_init_upstream;
     ngx_http_upstream_init_peer_pt     original_init_peer;
 
+    ngx_http_complex_value_t           pool_key;
+
 } ngx_http_upstream_keepalive_srv_conf_t;
 
 
@@ -32,6 +34,8 @@ typedef struct {
 
     socklen_t                          socklen;
     ngx_sockaddr_t                     sockaddr;
+
+    uint32_t                           pool_key_crc;
 
 } ngx_http_upstream_keepalive_cache_t;
 
@@ -45,6 +49,8 @@ typedef struct {
 
     ngx_event_get_peer_pt              original_get_peer;
     ngx_event_free_peer_pt             original_free_peer;
+
+    uint32_t                           pool_key_crc;
 
 #if (NGX_HTTP_SSL)
     ngx_event_set_peer_session_pt      original_set_session;
@@ -76,6 +82,10 @@ static void *ngx_http_upstream_keepalive_create_conf(ngx_conf_t *cf);
 static char *ngx_http_upstream_keepalive(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 
+static char *ngx_http_upstream_keepalive_pool_key(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static uint32_t ngx_get_pool_key(ngx_http_request_t *r,
+    ngx_http_upstream_keepalive_srv_conf_t *kcf);
 
 static ngx_command_t  ngx_http_upstream_keepalive_commands[] = {
 
@@ -98,6 +108,13 @@ static ngx_command_t  ngx_http_upstream_keepalive_commands[] = {
       ngx_conf_set_num_slot,
       NGX_HTTP_SRV_CONF_OFFSET,
       offsetof(ngx_http_upstream_keepalive_srv_conf_t, requests),
+      NULL },
+
+    { ngx_string("keepalive_pool"),
+      NGX_HTTP_UPS_CONF|NGX_CONF_TAKE1,
+      ngx_http_upstream_keepalive_pool_key,
+      NGX_HTTP_SRV_CONF_OFFSET,
+      0,
       NULL },
 
       ngx_null_command
@@ -179,6 +196,30 @@ ngx_http_upstream_init_keepalive(ngx_conf_t *cf,
     return NGX_OK;
 }
 
+static uint32_t ngx_get_pool_key(ngx_http_request_t *r,
+    ngx_http_upstream_keepalive_srv_conf_t *kcf) {
+
+  ngx_str_t   pool_key;
+
+  if (kcf->pool_key.value.data) {
+    if (ngx_http_complex_value(r, &kcf->pool_key, &pool_key) != NGX_OK) {
+      return 0;
+    }
+  }else {
+    pool_key.len = 0;
+  }
+
+  if (pool_key.len > 0) {
+    uint32_t val;
+    val =  ngx_crc32_long(pool_key.data, pool_key.len);
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP,
+        r->connection->log, 0,
+        "keepalive set pool for '%V' with id='%l'", &pool_key, val);
+    return val;
+  }
+
+  return 0;
+}
 
 static ngx_int_t
 ngx_http_upstream_init_keepalive_peer(ngx_http_request_t *r,
@@ -186,12 +227,11 @@ ngx_http_upstream_init_keepalive_peer(ngx_http_request_t *r,
 {
     ngx_http_upstream_keepalive_peer_data_t  *kp;
     ngx_http_upstream_keepalive_srv_conf_t   *kcf;
-
+    /* ngx_str_t                                 pool_key; */
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "init keepalive peer");
 
-    kcf = ngx_http_conf_upstream_srv_conf(us,
-                                          ngx_http_upstream_keepalive_module);
+    kcf = ngx_http_conf_upstream_srv_conf(us, ngx_http_upstream_keepalive_module);
 
     kp = ngx_palloc(r->pool, sizeof(ngx_http_upstream_keepalive_peer_data_t));
     if (kp == NULL) {
@@ -207,6 +247,7 @@ ngx_http_upstream_init_keepalive_peer(ngx_http_request_t *r,
     kp->data = r->upstream->peer.data;
     kp->original_get_peer = r->upstream->peer.get;
     kp->original_free_peer = r->upstream->peer.free;
+    kp->pool_key_crc = ngx_get_pool_key(r, kcf);
 
     r->upstream->peer.data = kp;
     r->upstream->peer.get = ngx_http_upstream_get_keepalive_peer;
@@ -245,7 +286,6 @@ ngx_http_upstream_get_keepalive_peer(ngx_peer_connection_t *pc, void *data)
     }
 
     /* search cache for suitable connection */
-
     cache = &kp->conf->cache;
 
     for (q = ngx_queue_head(cache);
@@ -254,10 +294,9 @@ ngx_http_upstream_get_keepalive_peer(ngx_peer_connection_t *pc, void *data)
     {
         item = ngx_queue_data(q, ngx_http_upstream_keepalive_cache_t, queue);
         c = item->connection;
-
         if (ngx_memn2cmp((u_char *) &item->sockaddr, (u_char *) pc->sockaddr,
                          item->socklen, pc->socklen)
-            == 0)
+            == 0 && item->pool_key_crc == kp->pool_key_crc)
         {
             ngx_queue_remove(q);
             ngx_queue_insert_head(&kp->conf->free, q);
@@ -384,6 +423,8 @@ ngx_http_upstream_free_keepalive_peer(ngx_peer_connection_t *pc, void *data,
     c->pool->log = ngx_cycle->log;
 
     item->socklen = pc->socklen;
+    item->pool_key_crc = kp->pool_key_crc;
+
     ngx_memcpy(&item->sockaddr, pc->sockaddr, pc->socklen);
 
     if (c->read->ready) {
@@ -556,6 +597,33 @@ ngx_http_upstream_keepalive(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                                   : ngx_http_upstream_init_round_robin;
 
     uscf->peer.init_upstream = ngx_http_upstream_init_keepalive;
+
+    return NGX_CONF_OK;
+}
+
+static char *
+ngx_http_upstream_keepalive_pool_key(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_http_upstream_keepalive_srv_conf_t  *kcf = conf;
+    ngx_str_t                               *value;
+    ngx_http_compile_complex_value_t         ccv;
+
+    value = cf->args->elts;
+
+    if (kcf->pool_key.value.data) {
+        return "is duplicate";
+    }
+
+    ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
+
+    ccv.cf = cf;
+    ccv.value = &value[1];
+    ccv.complex_value = &kcf->pool_key;
+
+    if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
 
     return NGX_CONF_OK;
 }
