@@ -1752,7 +1752,7 @@ ngx_http_upstream_ssl_handshake(ngx_http_request_t *r, ngx_http_upstream_t *u,
 
     if (c->ssl->handshaked) {
 
-        if (u->conf->ssl_verify) {
+        if (u->conf->ssl_verify || ngx_http_upstream_should_verified(r) == NGX_OK) {
             rc = SSL_get_verify_result(c->ssl->connection);
 
             if (rc != X509_V_OK) {
